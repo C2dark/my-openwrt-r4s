@@ -1,0 +1,181 @@
+name: Build NanoPi R4S Firmware
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: '请选择要构建的固件版本'
+        required: true
+        default: 'Plus (推荐日常版)'
+        type: choice
+        options:
+          - 'Plus (推荐日常版)'
+          - 'Origin (纯净无插件版)'
+          - 'Pro (Docker全能版)'
+          - 'All (并发编译全版本)'
+      lan_ip:
+        description: '自定义默认 LAN IP 地址 (若留空则使用默认 10.0.0.1)'
+        required: false
+        default: '10.0.0.1'
+
+env:
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: master
+  TZ: Asia/Shanghai
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      build_types: ${{ steps.set-matrix.outputs.build_types }}
+    steps:
+      - name: Resolve Matrix
+        id: set-matrix
+        run: |
+          case "${{ inputs.build_type }}" in
+            "Origin (纯净无插件版)")
+              echo 'build_types=["Origin"]' >> $GITHUB_OUTPUT
+              ;;
+            "Plus (推荐日常版)")
+              echo 'build_types=["Plus"]' >> $GITHUB_OUTPUT
+              ;;
+            "Pro (Docker全能版)")
+              echo 'build_types=["Pro"]' >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo 'build_types=["Origin", "Plus", "Pro"]' >> $GITHUB_OUTPUT
+              ;;
+          esac
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        type: ${{ fromJson(needs.prepare.outputs.build_types) }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Initialization Environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update -y
+          sudo apt-get full-upgrade -y
+          sudo apt-get install -y ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib \
+            git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev \
+            libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libreadline-dev libssl-dev libtool lrzsz \
+            mkisofs msmtp nano ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip libpython3-dev qemu-utils \
+            rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+          sudo timedatectl set-timezone "$TZ"
+
+      - name: Clone Source Code
+        run: |
+          git clone --depth 1 $REPO_URL -b $REPO_BRANCH openwrt
+
+      - name: Load Feeds & Custom Patches
+        run: |
+          cd openwrt
+          bash ../scripts/01-feeds.sh
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          bash ../scripts/02-patches.sh
+          bash ../scripts/03-custom.sh
+
+          # 如果用户手动指定了非默认的 LAN IP，则进行动态替换
+          if [ -n "${{ inputs.lan_ip }}" ] && [ "${{ inputs.lan_ip }}" != "10.0.0.1" ]; then
+              sed -i "s/10.0.0.1/${{ inputs.lan_ip }}/g" package/base-files/files/bin/config_generate
+          fi
+
+      - name: Generate Config (${{ matrix.type }})
+        run: |
+          cd openwrt
+          cat ../configs/common.config > .config
+
+          case "${{ matrix.type }}" in
+            "Origin")
+              cat ../configs/origin.config >> .config
+              ;;
+            "Plus")
+              cat ../configs/plus.config >> .config
+              ;;
+            "Pro")
+              cat ../configs/plus.config >> .config
+              cat ../configs/pro.config >> .config
+              ;;
+          esac
+
+          make defconfig
+
+      - name: Download Packages
+        run: |
+          cd openwrt
+          make download -j8
+          find dl -size -1024c -exec ls -l {} \;
+          find dl -size -1024c -exec rm -f {} \;
+
+      - name: Compile Firmware
+        run: |
+          cd openwrt
+          echo -e "$(nproc) thread compile"
+          make -j$(nproc) || make -j1 V=s
+
+      - name: Organize Output Files
+        id: organize
+        run: |
+          cd openwrt/bin/targets/rockchip/armv8
+          rm -rf packages
+          
+          # 重命名文件以区分版本类型
+          for file in *friendlyarm_nanopi-r4s*; do
+            if [ -f "$file" ]; then
+              mv "$file" "${{ matrix.type }}-$file"
+            fi
+          done
+
+          # 计算 SHA256 校验和
+          sha256sum ${{ matrix.type }}-*friendlyarm_nanopi-r4s* > ${{ matrix.type }}-sha256sums.txt
+          
+          echo "FIRMWARE_DIR=$PWD" >> $GITHUB_ENV
+          echo "RELEASE_TAG=R4S-$(date +'%Y%m%d-%H%M')" >> $GITHUB_ENV
+          echo "STATUS=success" >> $GITHUB_OUTPUT
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        if: steps.organize.outputs.STATUS == 'success'
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: "NanoPi R4S OpenWrt 固件 (${{ env.RELEASE_TAG }})"
+          body: |
+            ### 固件构建信息：
+            * **目标硬件**: FriendlyARM NanoPi R4S (4GB 版)
+            * **源码底座**: ImmortalWrt Master (Linux 6.12 LTS 原生内核)
+            * **包管理器**: APK (Alpine Package Keeper 3.0)
+            * **当前版本**: **${{ matrix.type }}**
+            * **默认 LAN IP**: `${{ inputs.lan_ip || '10.0.0.1' }}`
+            * **默认登录密码**: `无 (空密码)`
+            * **无线特性**: 内置 Realtek RTL8812BU USB 无线网卡驱动 (Plus/Pro 版)
+            * **硬件特性**: 内置稳定 MAC 保持补丁，解决 eth1 重启 MAC 变动问题
+
+            > 刷机建议：普通用户优先推荐烧录带有 `squashfs-sysupgrade.img.gz` 的镜像！
+          files: |
+            ${{ env.FIRMWARE_DIR }}/${{ matrix.type }}-*friendlyarm_nanopi-r4s*
+            ${{ env.FIRMWARE_DIR }}/${{ matrix.type }}-sha256sums.txt
+          token: ${{ secrets.GITHUB_TOKEN }}

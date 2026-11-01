@@ -1,0 +1,12 @@
+# OpenWrt build ignores
+bin/
+dl/
+build_dir/
+staging_dir/
+tmp/
+*.img
+*.img.gz
+*.tar.gz
+*.log
+.DS_Store
+Thumbs.db
